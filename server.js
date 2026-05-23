@@ -66,7 +66,52 @@ const parseScorecardSection = ($, sectionName) => {
                 sixes: parseNumber(cells.eq(4).text()),
                 strikeRate: parseNumber(cells.eq(5).text()),
             };
-            });
+        });
+};
+
+const parsePointsTableMatchRows = ($, section) => {
+    return section
+        .find("div.grid.point-table-item-grid")
+        .map((_, row) => {
+            const cells = $(row).children("div");
+            const resultText = cleanText(cells.eq(3).text());
+            const nrrChange = parseNumber(cells.eq(4).text());
+
+            return {
+                opposition: cleanText(cells.eq(0).text()),
+                description: cleanText(cells.eq(1).text()),
+                date: cleanText(cells.eq(2).text()),
+                result: resultText,
+                nrrChange: nrrChange,
+                hasResult: resultText !== "-",
+            };
+        })
+        .get();
+};
+
+const parsePointsTableSection = ($) => {
+    return $("div.grid.point-table-grid.p-2.cursor-pointer")
+        .map((_, row) => {
+            const cells = $(row).children("div");
+            const teamCell = cells.eq(1);
+            const teamName = cleanText(teamCell.find("span").first().text());
+            const qualificationTag = cleanText(teamCell.find("span").eq(1).text());
+            const detailsSection = $(row).parent().next();
+
+            return {
+                rank: parseNumber(cells.eq(0).text()),
+                team: teamName,
+                qualification: qualificationTag || null,
+                played: parseNumber(cells.eq(2).text()),
+                won: parseNumber(cells.eq(3).text()),
+                lost: parseNumber(cells.eq(4).text()),
+                noResult: parseNumber(cells.eq(5).text()),
+                points: parseNumber(cells.eq(6).text()),
+                netRunRate: parseNumber(cells.eq(7).text()),
+                matches: detailsSection.length ? parsePointsTableMatchRows($, detailsSection) : [],
+            };
+        })
+        .get();
 };
 
 app.get("/score", async (req, res) => {
@@ -130,6 +175,38 @@ app.get("/score", async (req, res) => {
         res.status(500).json({
             success: false,
             error: "Failed to fetch score"
+        });
+    }
+});
+
+app.get("/points-table", async (req, res) => {
+    try {
+        const homeUrl = "https://m.cricbuzz.com/";
+        const homeResponse = await axios.get(homeUrl);
+        const home$ = cheerio.load(homeResponse.data);
+        const pointsTableUrl = home$("a[href*='/points-table']").first().attr("href");
+
+        if (!pointsTableUrl) {
+            return res.status(404).json({
+                success: false,
+                error: "Points table link not found",
+            });
+        }
+
+        const pointsResponse = await axios.get(`https://m.cricbuzz.com${pointsTableUrl}`);
+        const $ = cheerio.load(pointsResponse.data);
+        const pointsTable = parsePointsTableSection($);
+
+        res.json({
+            success: true,
+            data: pointsTable,
+        });
+    } catch (err) {
+        console.error(err);
+
+        res.status(500).json({
+            success: false,
+            error: "Failed to fetch points table",
         });
     }
 });
