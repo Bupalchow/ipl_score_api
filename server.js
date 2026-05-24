@@ -3,8 +3,101 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 
 const app = express();
+const CRICBUZZ_BASE_URL = "https://m.cricbuzz.com";
+const CURRENT_YEAR = new Date().getFullYear();
+const CURRENT_IPL_SERIES_SLUG = `indian-premier-league-${CURRENT_YEAR}`;
 
 const cleanText = (value) => (value || "").replace(/\s+/g, " ").trim();
+
+const IPL_TEAM_DEFINITIONS = [
+    {
+        code: "RCB",
+        name: "Royal Challengers Bengaluru",
+        aliases: ["rcb", "royal challengers bengaluru", "royal challengers bangalore"],
+    },
+    {
+        code: "MI",
+        name: "Mumbai Indians",
+        aliases: ["mi", "mumbai indians"],
+    },
+    {
+        code: "CSK",
+        name: "Chennai Super Kings",
+        aliases: ["csk", "chennai super kings"],
+    },
+    {
+        code: "KKR",
+        name: "Kolkata Knight Riders",
+        aliases: ["kkr", "kolkata knight riders"],
+    },
+    {
+        code: "PBKS",
+        name: "Punjab Kings",
+        aliases: ["pbks", "punjab kings", "kings xi punjab"],
+    },
+    {
+        code: "SRH",
+        name: "Sunrisers Hyderabad",
+        aliases: ["srh", "sunrisers hyderabad"],
+    },
+    {
+        code: "RR",
+        name: "Rajasthan Royals",
+        aliases: ["rr", "rajasthan royals"],
+    },
+    {
+        code: "DC",
+        name: "Delhi Capitals",
+        aliases: ["dc", "delhi capitals", "delhi daredevils"],
+    },
+    {
+        code: "GT",
+        name: "Gujarat Titans",
+        aliases: ["gt", "gujarat titans"],
+    },
+    {
+        code: "LSG",
+        name: "Lucknow Super Giants",
+        aliases: ["lsg", "lucknow super giants"],
+    },
+];
+
+const normalizeLookupKey = (value) => cleanText(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+const IPL_TEAM_LOOKUP = IPL_TEAM_DEFINITIONS.reduce((lookup, team) => {
+    lookup[normalizeLookupKey(team.code)] = team;
+    lookup[normalizeLookupKey(team.name)] = team;
+
+    team.aliases.forEach((alias) => {
+        lookup[normalizeLookupKey(alias)] = team;
+    });
+
+    return lookup;
+}, {});
+
+const getIplTeamDefinition = (teamName) => IPL_TEAM_LOOKUP[normalizeLookupKey(teamName)] || null;
+
+const getCurrentIplSeriesBaseUrl = async () => {
+    const homeResponse = await axios.get(CRICBUZZ_BASE_URL);
+    const home$ = cheerio.load(homeResponse.data);
+
+    const currentSeriesHref = home$('a[href*="/cricket-series/"]')
+        .map((_, element) => home$(element).attr("href"))
+        .get()
+        .find((href) => href && href.includes(CURRENT_IPL_SERIES_SLUG) && href.includes("/points-table"));
+
+    if (currentSeriesHref) {
+        return `${CRICBUZZ_BASE_URL}${currentSeriesHref.replace(/\/points-table$/, "")}`;
+    }
+
+    return `${CRICBUZZ_BASE_URL}/cricket-series/9241/${CURRENT_IPL_SERIES_SLUG}`;
+};
+
+const getCurrentIplPointsTable = async () => {
+    const seriesBaseUrl = await getCurrentIplSeriesBaseUrl();
+    const response = await axios.get(`${seriesBaseUrl}/points-table`);
+    return cheerio.load(response.data);
+};
 
 const parseNumber = (value) => {
     const parsedValue = parseFloat(cleanText(value).replace(/[^\d.\-]/g, ""));
@@ -72,18 +165,21 @@ const parseScorecardSection = ($, sectionName) => {
 const parsePointsTableMatchRows = ($, section) => {
     return section
         .find("div.grid.point-table-item-grid")
+        .filter((_, row) => cleanText($(row).children("div").first().text()) !== "Opposition")
         .map((_, row) => {
             const cells = $(row).children("div");
             const resultText = cleanText(cells.eq(3).text());
             const nrrChange = parseNumber(cells.eq(4).text());
+            const scoreLink = cleanText($(row).find("a").first().attr("href"));
 
             return {
                 opposition: cleanText(cells.eq(0).text()),
                 description: cleanText(cells.eq(1).text()),
                 date: cleanText(cells.eq(2).text()),
-                result: resultText,
+                result: resultText === "-" ? null : resultText,
                 nrrChange: nrrChange,
                 hasResult: resultText !== "-",
+                scoreUrl: scoreLink || null,
             };
         })
         .get();
@@ -96,7 +192,7 @@ const parsePointsTableSection = ($) => {
             const teamCell = cells.eq(1);
             const teamName = cleanText(teamCell.find("span").first().text());
             const qualificationTag = cleanText(teamCell.find("span").eq(1).text());
-            const detailsSection = $(row).parent().next();
+            const detailsSection = $(row).next();
 
             return {
                 rank: parseNumber(cells.eq(0).text()),
@@ -181,20 +277,7 @@ app.get("/score", async (req, res) => {
 
 app.get("/points-table", async (req, res) => {
     try {
-        const homeUrl = "https://m.cricbuzz.com/";
-        const homeResponse = await axios.get(homeUrl);
-        const home$ = cheerio.load(homeResponse.data);
-        const pointsTableUrl = home$("a[href*='/points-table']").first().attr("href");
-
-        if (!pointsTableUrl) {
-            return res.status(404).json({
-                success: false,
-                error: "Points table link not found",
-            });
-        }
-
-        const pointsResponse = await axios.get(`https://m.cricbuzz.com${pointsTableUrl}`);
-        const $ = cheerio.load(pointsResponse.data);
+        const $ = await getCurrentIplPointsTable();
         const pointsTable = parsePointsTableSection($);
 
         res.json({
@@ -207,6 +290,64 @@ app.get("/points-table", async (req, res) => {
         res.status(500).json({
             success: false,
             error: "Failed to fetch points table",
+        });
+    }
+});
+
+app.get("/team-matches/:teamName", async (req, res) => {
+    try {
+        const requestedTeam = getIplTeamDefinition(req.params.teamName);
+
+        if (!requestedTeam) {
+            return res.status(400).json({
+                success: false,
+                error: "Unsupported team name",
+                supportedTeams: IPL_TEAM_DEFINITIONS.map((team) => team.name),
+            });
+        }
+
+        const $ = await getCurrentIplPointsTable();
+        const pointsTable = parsePointsTableSection($);
+        const teamRow = pointsTable.find((row) => normalizeLookupKey(row.team) === normalizeLookupKey(requestedTeam.code));
+
+        if (!teamRow) {
+            return res.status(404).json({
+                success: false,
+                error: `Team ${requestedTeam.name} was not found in the current IPL points table`,
+            });
+        }
+
+        const playedMatches = teamRow.matches.filter((match) => match.hasResult);
+        const upcomingMatches = teamRow.matches.filter((match) => !match.hasResult);
+
+        res.json({
+            success: true,
+            data: {
+                season: CURRENT_YEAR,
+                team: {
+                    code: requestedTeam.code,
+                    name: requestedTeam.name,
+                    qualification: teamRow.qualification,
+                    pointsTable: {
+                        rank: teamRow.rank,
+                        played: teamRow.played,
+                        won: teamRow.won,
+                        lost: teamRow.lost,
+                        noResult: teamRow.noResult,
+                        points: teamRow.points,
+                        netRunRate: teamRow.netRunRate,
+                    },
+                },
+                playedMatches,
+                upcomingMatches,
+            },
+        });
+    } catch (err) {
+        console.error(err);
+
+        res.status(500).json({
+            success: false,
+            error: "Failed to fetch team matches",
         });
     }
 });
